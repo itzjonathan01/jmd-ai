@@ -55,6 +55,16 @@ svg{width:20px;height:20px;fill:none;stroke:currentColor;stroke-width:1.9;stroke
   position:fixed;inset:0;display:flex;flex-direction:column;
   padding:env(safe-area-inset-top) env(safe-area-inset-right) 0 env(safe-area-inset-left);
 }
+/* A fixed element is sized against the layout viewport, which on iOS
+   Safari includes the strip the toolbars sit over. Inside an iframe
+   there are no toolbars and inset:0 is exactly right; opened as a real
+   page, the bottom of the app — the composer — ends up underneath the
+   browser's own bar. The dynamic viewport unit is the height actually
+   available right now, so the composer stays reachable whether the
+   toolbars are showing or not. */
+@supports (height:100dvh){
+  #app{height:100dvh;bottom:auto}
+}
 .bar{
   display:flex;align-items:center;justify-content:space-between;
   padding:10px 14px 8px;border-bottom:1px solid var(--line);flex:0 0 auto;

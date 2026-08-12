@@ -2149,6 +2149,7 @@ const WEBCFG = {
   provider: 'auto',       // auto | wikipedia | duckduckgo | none
   maxSources: 3,
   cache: true,
+  debug: false,           // keep per-sentence scoring, for the developer panel
   proxy: '',              // optional reader proxy for arbitrary URLs, off by default
   timeoutMs: 6000,
 };
@@ -2187,8 +2188,10 @@ const DYNAMIC_TOPIC = /\b(weather|forecast|temperature outside|news|headline|sco
 const EXPLICIT_WEB = /\b(search (the )?(web|online|internet)|look (it|this|that)? ?up online|google (it|this|that)|check online|browse|fetch|on the internet|web search)\b/i;
 const STATIC_TOPIC = /\b(gravity|photosynthesis|recursion|algorithm|derivative|integral|atom|molecule|evolution|thermodynamics|pythagoras|syntax|definition of)\b/i;
 
+const SHAPE_NOUN = { person: 'name', date: 'date', count: 'figure', measure: 'measurement', place: 'place', reason: 'reason', version: 'version number' };
+
 /* Returns null when the web is not warranted, otherwise why it is. */
-function webNeeded(text, internalConf, hadAnswer) {
+function webNeeded(text, internalConf, hadAnswer, internalSay) {
   if (!WEBCFG.enabled) return null;
   const t = String(text);
   if (EXPLICIT_WEB.test(t)) return { reason: 'you asked me to look it up', force: true, strong: true };
@@ -2201,6 +2204,22 @@ function webNeeded(text, internalConf, hadAnswer) {
   if (fresh && dyn) return { reason: 'this changes and you asked for the current state', strong: true };
   if (dyn && !STATIC_TOPIC.test(t)) return { reason: 'this is the kind of thing that changes', strong: true };
   if (fresh && !STATIC_TOPIC.test(t)) return { reason: 'you asked for the latest', strong: true };
+
+  /* An answer of the wrong kind is not an answer.
+
+     This gate used to fire only when retrieval came back empty or
+     unconfident, which meant a confident answer to a different question
+     silently blocked the web. Asked who founded Google, the internal
+     store returned its entry for "search engine" — a perfectly good
+     paragraph that names nobody — and that counted as answered.
+
+     So when the question asks for a name, a year or a measurement, look
+     at whether what came back contains one. If it does not, the store
+     does not actually hold this, however sure of itself it sounded. */
+  const shape = answerShape(t);
+  if (shape && !STATIC_TOPIC.test(t) && !shapeHit(shape, internalSay))
+    return { reason: 'what I have internally does not give a ' + (SHAPE_NOUN[shape.k] || 'clear answer') };
+
   if (!hadAnswer && internalConf < 0.35 && tok(t).length >= 3 && !STATIC_TOPIC.test(t))
     return { reason: 'I do not have this internally' };
   return null;
@@ -2219,30 +2238,160 @@ function cacheTtl(query) {
 
 /* ---- query rewriting -------------------------------------------------
    "bro can you check online rn and tell me what the newest python
-   version actually is" is not a search query. This turns it into one. */
-const FILLER = /\b(bro|mate|dude|please|pls|plz|can you|could you|would you|i want to know|tell me|do you know|check online|look it up|search( the)?( web| online| internet)?|google|actually|really|just|rn|right now|for me|thanks|thx|hey|hi|hello|ok|okay|so|um|uh|like|kinda|sorta|basically|honestly|btw)\b/gi;
+   version actually is" is not a search query. This turns it into one.
+
+   The hard part is knowing what not to remove. This used to strip a flat
+   list of chatty words wherever they appeared, which quietly destroyed
+   the question itself:
+
+     who founded google           ->  who founded
+     what is a hello world program->  a world program
+     how does the like button work->  the button work
+
+   Every one of those words is filler in some sentences and the entire
+   subject in others, so position decides. Greetings and politeness are
+   only filler at the very start or end, where they cannot be the thing
+   being asked about. Only the few discourse adverbs that are almost
+   never a subject come out mid-sentence.
+
+   The question word stays. Search engines handle natural questions
+   well — "who founded google" outranks "founded google" — and "who" is
+   also what tells the answer picker downstream to go looking for a
+   name rather than a paragraph. */
+const LEAD = /^(?:\s*(?:bro|mate|dude|hey|hi|hello|yo|ok|okay|so|um|uh|well|please|pls|plz|btw)\b[\s,]*)+/i;
+const TAIL = /[\s,]*(?:please|pls|plz|thanks|thank you|thx|for me|mate|bro|dude)\s*[.?!]*$/i;
+const ASK = /\b(?:can|could|would|will)\s+you\b|\bi\s+(?:want|need)\s+to\s+know\b|\btell\s+me\b|\bdo\s+you\s+know\b/gi;
+const CMD = /\b(?:search(?:\s+(?:the\s+)?(?:web|online|internet))?\s+for|search\s+(?:the\s+)?(?:web|online|internet)|look\s+(?:it|this|that)?\s*up(?:\s+online)?|google\s+(?:it|this|that)|check\s+online|on\s+the\s+internet|web\s+search)\b/gi;
+const HEDGE = /\b(?:actually|basically|honestly|literally|kinda|sorta|rn|right\s+now)\b/gi;
+
 function webQuery(text) {
-  let q = String(text)
-    .replace(/^[^a-z0-9]*/i, '')
-    .replace(FILLER, ' ')
-    .replace(/\b(what|whats|what's|who|whose|when|where|which|how)\s+(is|are|was|were|does|do|did)\b/gi, ' ')
-    .replace(/\?+/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-  if (q.split(/\s+/).length < 2) q = String(text).replace(/\?+/g, '').trim();
+  let q = String(text).replace(/^[^\p{L}\p{N}]+/u, '');
+  q = q.replace(LEAD, '');
+  q = q.replace(CMD, ' ').replace(ASK, ' ').replace(HEDGE, ' ');
+  q = q.replace(/\s+/g, ' ').trim();
+  q = q.replace(LEAD, '').replace(TAIL, '');
+  q = q.replace(/^(?:and|but|so|then|also|now)\b[\s,]*/i, '');
+  q = q.replace(/\?+/g, ' ').replace(/\s+/g, ' ').trim();
+  if (q.length < 2) q = String(text).replace(/\?+/g, '').trim();
   return q.slice(0, 200);
 }
+
+/* The same question with the grammar taken out, for when the natural
+   phrasing finds nothing: "how many moons does jupiter have" ->
+   "moons jupiter". Entity-shaped queries match titles that full
+   sentences miss. */
+const GRAMMAR = /^(?:what|whats|what's|who|whose|whom|when|where|which|why|how|is|are|was|were|do|does|did|can|could|the|a|an|of|in|on|at|to|for|and|has|have|had|there|its|it's|s)$/i;
+function keywordQuery(text) {
+  const words = webQuery(text).split(/\s+/)
+    .map(w => w.replace(/[^\p{L}\p{N}'’.-]/gu, ''))
+    .filter(w => w && !GRAMMAR.test(w) && !STOP.has(w.toLowerCase()));
+  return words.join(' ');
+}
+
 /* When one phrasing finds nothing, try a differently-shaped one rather
    than the same words again. */
 function queryVariants(text) {
   const base = webQuery(text);
   const out = [base];
-  const noYear = base.replace(/\b20[0-9]{2}\b/g, '').replace(/\s+/g, ' ').trim();
-  if (noYear !== base && noYear.length > 3) out.push(noYear);
-  const head = base.split(/\s+/).slice(0, 4).join(' ');
-  if (head !== base && head.length > 3) out.push(head);
-  if (/\b(latest|newest|current)\b/i.test(text)) out.push(base.replace(/\b(latest|newest|current)\b/gi, '').trim() + ' latest version');
+  const kw = keywordQuery(text);
+  if (kw && kw !== base) out.push(kw);
+  const bare = base
+    .replace(/\b20[0-9]{2}\b/g, '')
+    .replace(/\b(latest|newest|current(ly)?|today|tonight|so far|as of|right now)\b/gi, '')
+    .replace(/\s+/g, ' ').trim();
+  if (bare && bare !== base && bare.length > 3) out.push(bare);
   return [...new Set(out.filter(x => x.length > 2))].slice(0, 3);
+}
+
+/* ---- what shape of answer is being asked for ------------------------
+   "who" wants a name, "when" wants a year, "how tall" wants a number
+   with a unit. Knowing which is most of the difference between quoting
+   the paragraph that mentions the subject and quoting the sentence that
+   actually answers the question. Asked who the president of France is,
+   the article's opening paragraph explains the constitutional office at
+   length and never names anybody; a sentence three results down says
+   "Emmanuel Macron, who took office on 14 May 2017". Only one of those
+   is an answer, and the difference between them is detectable. */
+/* Two capitalised words in a row is the cheap test for a person's name,
+   and on its own it is far too cheap: "the French Republic", "the Solar
+   System" and "the French Armed Forces" all pass it, which is how a
+   paragraph defining the presidency came to look like an answer to who
+   the president is.
+
+   Two things separate a name from an institution almost every time. A
+   personal name does not take a definite article — nobody writes "the
+   Emmanuel Macron" — and the second word of an institution is usually
+   drawn from a small vocabulary of institutional nouns. Both are cheap
+   to check and neither needs a list of actual names. */
+const ORG_TAIL = /^(Republic|Kingdom|States?|System|Union|Empire|Federation|Alliance|Commission|Council|Committee|Party|Assembly|Parliament|Congress|Court|University|College|School|Institute|Academy|Society|Association|Foundation|Company|Corporation|Group|Bank|Museum|Library|Theatre|Theater|Hospital|Airlines|Airport|Army|Navy|Forces|Guard|Palace|Castle|Tower|Bridge|Street|Avenue|Road|Square|Park|Ocean|Sea|Bay|Gulf|Lake|River|Island|Islands|Mountains?|Valley|Desert|Coast|War|Wars|Games|Cup|League|Series|Award|Prize|Medal|Era|Age|Period|Century|Republicans?|Democrats?)$/;
+const NATION = /^(French|German|American|British|English|Scottish|Irish|Welsh|Chinese|Japanese|Russian|Italian|Spanish|Portuguese|Dutch|Swedish|Norwegian|Danish|Finnish|Polish|Greek|Turkish|Indian|Pakistani|Korean|Vietnamese|Thai|Israeli|Egyptian|Nigerian|Kenyan|European|African|Asian|Australian|Canadian|Mexican|Brazilian|Argentine|Soviet|Roman|Greek|Latin|Ottoman|Byzantine|United|Northern|Southern|Eastern|Western|Central|Royal|National|International|Federal|Supreme|General|Great|Ancient|Old|Modern|Classical|Middle|Early|Late)$/;
+const NAME_RE = /\b(\p{Lu}[\p{L}'’-]+)(?:\s+(?:van|von|de|del|della|di|da|bin|al|ibn)\s+|\s+)(\p{Lu}[\p{L}'’-]+)/gu;
+function hasPersonName(text, ctx) {
+  const t = String(text);
+  const title = ctx && ctx.title ? String(ctx.title).toLowerCase() : '';
+  NAME_RE.lastIndex = 0;
+  let m;
+  while ((m = NAME_RE.exec(t))) {
+    if (/\b(?:the|The)\s+$/.test(t.slice(Math.max(0, m.index - 6), m.index))) continue;
+    if (NATION.test(m[1]) || ORG_TAIL.test(m[2])) continue;
+    /* An article's own title is its subject, not the answer to "who".
+       "Google Search (also known simply as Google) is a search engine"
+       is two capitalised words and no person at all. */
+    if (title && title.includes(m[0].toLowerCase())) continue;
+    return true;
+  }
+  return false;
+}
+
+const SHAPES = [
+  { k: 'version', q: /\b(latest|newest|current)\s+(stable\s+)?(version|release)\b|\bversion\s+(number|is)\b/i,
+    re: /\b\d+\.\d+(?:\.\d+)?\b/ },
+  { k: 'person', q: /^\s*who\b|\bwho\s+(is|was|are|were|founded|created|invented|wrote|discovered|built|leads?|runs?|owns?)\b/i,
+    fn: hasPersonName },
+  { k: 'date', q: /^\s*when\b|\bwhat\s+year\b|\bwhat\s+date\b|\bhow\s+long\s+ago\b/i,
+    re: /\b(?:\d{1,2}\s+)?(?:January|February|March|April|May|June|July|August|September|October|November|December)?\s*\b(?:1[0-9]{3}|20[0-9]{2})\b/ },
+  /* "How tall" and "how many" both want a number, but not the same one.
+     A bare year satisfies "a number appears here", which is how "built
+     the tower from 1887 to 1889" came to outrank "it is 330 metres
+     tall" as an answer to how tall the Eiffel Tower is. A measurement
+     question wants a figure carrying a unit; a counting question wants
+     a bare figure. `re` is the strong form, `weak` the acceptable one. */
+  { k: 'measure', q: /^\s*how\s+(tall|high|long|far|deep|wide|heavy|fast|old)\b|\bhow\s+much\s+does\s+.*\bweigh/i,
+    re: /\b\d[\d,]*(?:\.\d+)?\s*(?:km\/h|mph|m\/s|km|cm|mm|nm|ft|feet|foot|inch(?:es)?|miles?|metres?|meters?|kilometres?|kilometers?|kg|kilograms?|tonnes?|tons?|pounds?|lbs?|years?\s+old|light[- ]years?)\b/i,
+    weak: /\b\d[\d,]*(?:\.\d+)?\b/ },
+  { k: 'count', q: /^\s*how\s+(many|much)\b|\bpopulation\s+of\b|\bnumber\s+of\b/i,
+    re: /\b\d[\d,]*(?:\.\d+)?\b/,
+    weak: /\b(?:one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|twenty|thirty|forty|fifty|hundred|thousand|million|billion|dozen)\b/i },
+  { k: 'place', q: /^\s*where\b/i,
+    re: /\b(?:in|near|within|across|throughout)\s+(?!Earth|World|Europe\b)\p{Lu}[\p{L}'’-]+/u,
+    weak: /\b(?:in|on|at)\s+\p{Lu}[\p{L}'’-]+/u },
+  { k: 'reason', q: /^\s*why\b/i, re: /\b(because|due to|as a result of|owing to|so that|caused by|in order to)\b/i },
+];
+function answerShape(question) {
+  const q = String(question);
+  for (const s of SHAPES) if (s.q.test(q)) return s;
+  return null;
+}
+/* The words that build the question rather than name its subject. They
+   have to come out of the keyword set: "how many moons does jupiter
+   have" carries "many" into the terms to be matched, and no answer ever
+   contains it, so the sentence that actually answers ("There are 115
+   known moons of the planet Jupiter") scores two-thirds while a rambling
+   one that happens to say "many" scores full marks. */
+const QFRAME = /^(?:many|much|tall|high|long|far|old|fast|big|deep|wide|heavy|often|kind|type|sort|called|name|mean|means|meaning)$/i;
+function contentSet(question) {
+  return new Set(tok(question)
+    .filter(w => !STOP.has(w) && w.length > 2 && !QFRAME.test(w))
+    .map(stem));
+}
+
+/* 1 for the shape asked for, 0.6 for a weaker form of it, 0 for neither. */
+function shapeHit(shape, text, ctx) {
+  if (!shape) return 0;
+  const t = String(text || '');
+  if (shape.fn ? shape.fn(t, ctx) : shape.re.test(t)) return 1;
+  if (shape.weak && shape.weak.test(t)) return 0.6;
+  return 0;
 }
 
 /* ---- prompt-injection defence ---------------------------------------
@@ -2303,6 +2452,13 @@ function decodeEntities(s) {
   });
 }
 
+/* Search snippets come back as HTML: the matched words are wrapped in
+   <span class="searchmatch"> and the punctuation is entity-encoded, so
+   an untouched snippet reads "world&#039;s most valuable brands". */
+function cleanSnippet(s) {
+  return decodeEntities(String(s || '').replace(/<[^>]+>/g, '')).replace(/\s+/g, ' ').trim();
+}
+
 /* Split a document into chunks a small model can actually weigh. Whole
    pages stuffed into the reasoner drown the signal; paragraphs do not. */
 function chunk(text, size = 500) {
@@ -2344,16 +2500,59 @@ const PROVIDERS = {
   wikipedia: {
     name: 'Wikipedia',
     async search(q, n) {
-      const u = 'https://en.wikipedia.org/w/api.php?action=query&format=json&origin=*&generator=search&gsrsearch=' +
-        encodeURIComponent(q) + '&gsrlimit=' + n + '&prop=extracts|info&exintro=1&explaintext=1&inprop=url';
+      /* One request, two views of the same result set.
+
+         `generator=search` with `prop=extracts` returns each article's
+         opening paragraph. That is good context and completely
+         independent of what was asked. `list=search` returns the snippet
+         Wikipedia's own search picked out *for this query*, which is
+         usually where the answer is. Asked who founded Google, the intro
+         describes the company; the snippet says "Google was founded in
+         1998 by American c...". Both come back from the same call, so
+         the extra signal costs nothing.
+
+         The generator's pages arrive keyed by page id, which means
+         Object.values() yields page-id order, not relevance order. This
+         used to return them exactly that way and threw Wikipedia's
+         ranking on the floor: for "president of france" the top hit
+         arrived third, behind an article about presidential spouses.
+         `index` is the search rank, and sorting by it is the fix. */
+      const e = encodeURIComponent(q);
+      const u = 'https://en.wikipedia.org/w/api.php?action=query&format=json&origin=*' +
+        '&generator=search&gsrsearch=' + e + '&gsrlimit=' + n +
+        '&prop=extracts|info&exintro=1&explaintext=1&inprop=url' +
+        '&list=search&srsearch=' + e + '&srlimit=' + n + '&srprop=snippet';
       const d = await getJSON(u);
-      const pages = d && d.query && d.query.pages ? Object.values(d.query.pages) : [];
-      return pages.map(p => ({
-        title: p.title,
-        url: p.fullurl || ('https://en.wikipedia.org/wiki/' + encodeURIComponent(p.title)),
-        snippet: String(p.extract || '').slice(0, 1200),
-        provider: 'Wikipedia',
-      })).filter(r => r.snippet.length > 40);
+      const qr = (d && d.query) || {};
+      const link = t => 'https://en.wikipedia.org/wiki/' + encodeURIComponent(String(t).replace(/ /g, '_'));
+      const matches = new Map();
+      for (const s of (qr.search || [])) matches.set(s.title, cleanSnippet(s.snippet));
+
+      const pages = qr.pages ? Object.values(qr.pages) : [];
+      pages.sort((a, b) => (a.index || 99) - (b.index || 99));
+      const out = [], seen = new Set();
+      for (const p of pages) {
+        seen.add(p.title);
+        const intro = String(p.extract || '').slice(0, 1200);
+        const m = matches.get(p.title) || '';
+        out.push({
+          title: p.title,
+          url: p.fullurl || link(p.title),
+          snippet: m && intro ? m + '\n' + intro : (m || intro),
+          match: m,
+          rank: p.index || out.length + 1,
+          provider: 'Wikipedia',
+        });
+      }
+      /* An article the snippet list found but the generator did not is
+         still a result — the two lists agree almost always, and when
+         they do not the extra one is free. */
+      for (const s of (qr.search || [])) {
+        if (seen.has(s.title)) continue;
+        const m = cleanSnippet(s.snippet);
+        if (m.length > 40) out.push({ title: s.title, url: link(s.title), snippet: m, match: m, rank: out.length + 1, provider: 'Wikipedia' });
+      }
+      return out.filter(r => r.snippet.length > 40);
     },
   },
   duckduckgo: {
@@ -2362,11 +2561,12 @@ const PROVIDERS = {
       const u = 'https://api.duckduckgo.com/?format=json&no_html=1&skip_disambig=1&t=jmdai&q=' + encodeURIComponent(q);
       const d = await getJSON(u);
       const out = [];
-      if (d.AbstractText) out.push({ title: d.Heading || q, url: d.AbstractURL || '', snippet: d.AbstractText, provider: 'DuckDuckGo' });
-      if (d.Answer) out.push({ title: d.AnswerType || 'Answer', url: d.AbstractURL || '', snippet: String(d.Answer).replace(/<[^>]+>/g, ''), provider: 'DuckDuckGo' });
+      const add = o => out.push({ ...o, match: o.snippet, rank: out.length + 1, provider: 'DuckDuckGo' });
+      if (d.Answer) add({ title: d.AnswerType || 'Answer', url: d.AbstractURL || '', snippet: String(d.Answer).replace(/<[^>]+>/g, '') });
+      if (d.AbstractText) add({ title: d.Heading || q, url: d.AbstractURL || '', snippet: d.AbstractText });
       for (const t of (d.RelatedTopics || [])) {
         if (out.length >= n) break;
-        if (t.Text) out.push({ title: (t.Text.split(' - ')[0] || '').slice(0, 80), url: t.FirstURL || '', snippet: t.Text, provider: 'DuckDuckGo' });
+        if (t.Text) add({ title: (t.Text.split(' - ')[0] || '').slice(0, 80), url: t.FirstURL || '', snippet: t.Text });
       }
       return out.slice(0, n);
     },
@@ -2374,12 +2574,20 @@ const PROVIDERS = {
 };
 
 /* ---- ranking --------------------------------------------------------
-   Semantic closeness to the question, keyword overlap, and how much the
-   source is worth trusting. In that order of weight, because a very
-   reliable page about the wrong thing is still the wrong answer. */
+   Semantic closeness to the question, keyword overlap, whether the
+   title is about the thing asked about, how much the source is worth
+   trusting — and, importantly, where the search engine itself put it.
+
+   That last term was missing. A 56-dimension embedding trained on this
+   project's own corpus is a useful tie-breaker and a terrible primary
+   ranker; Wikipedia's relevance ordering is the product of far more
+   signal than anything available in the page. Ignoring it meant a
+   locally-computed cosine could promote the fourth result over the
+   first. It is folded in as a reciprocal rank, so being first matters a
+   lot and the gap between fourth and fifth barely registers. */
 function rank(results, query) {
   const qv = sentVec(tok(query));
-  const qset = new Set(tok(query).filter(w => !STOP.has(w) && w.length > 2).map(stem));
+  const qset = contentSet(query);
   return results.map(r => {
     const rel = reliability(r.url);
     let sem = 0;
@@ -2388,7 +2596,10 @@ function rank(results, query) {
     const words = tok(r.title + ' ' + r.snippet).map(stem);
     const hit = words.filter(w => qset.has(w)).length;
     const kw = qset.size ? Math.min(1, hit / (qset.size * 2)) : 0;
-    const score = 0.5 * Math.max(0, sem) + 0.3 * kw + 0.2 * rel.score;
+    const tset = new Set(tok(r.title).map(stem));
+    const title = qset.size ? [...qset].filter(w => tset.has(w)).length / qset.size : 0;
+    const rr = 1 / (1 + 0.6 * Math.max(0, (r.rank || 1) - 1));
+    const score = 0.32 * Math.max(0, sem) + 0.22 * kw + 0.10 * title + 0.22 * rr + 0.14 * rel.score;
     return { ...r, reliability: rel, score };
   }).sort((a, b) => b.score - a.score);
 }
@@ -2443,7 +2654,9 @@ function cachePut(key, query, results) {
   WEBDB.docs.push({
     key, query, at: Date.now(), exp: Date.now() + ttl, used: 0,
     hash: hashOf(results.map(r => r.snippet).join('')),
-    results: results.map(r => ({ title: r.title, url: r.url, snippet: r.snippet.slice(0, 1500), provider: r.provider, rel: r.reliability ? r.reliability.score : 0.5 })),
+    results: results.map(r => ({ title: r.title, url: r.url, snippet: r.snippet.slice(0, 1500),
+                                 match: (r.match || '').slice(0, 600), rank: r.rank || 1,
+                                 provider: r.provider, rel: r.reliability ? r.reliability.score : 0.5 })),
   });
   if (WEBDB.docs.length > 120) webTrim(false);
   webSave();
@@ -2516,28 +2729,162 @@ async function webSearch(rawQuestion, onStage) {
 /* Turn ranked sources into an answer. Extractive on purpose: this model
    is far too small to paraphrase a page without inventing something, and
    an invented sentence with a citation under it is worse than no answer. */
+/* Reference lists leak into extracts, and a citation is not a sentence:
+   asked who invented the telephone, the best-scoring line was the title
+   of a book about the question — '"Who Invented the Telephone?: Lawyers,
+   Patents, and the Judgments of History".' It matches every keyword and
+   answers nothing. */
+const CITATION = /^["“]|^\d{3,4}\s*,|\b(?:ISBN|doi:|Retrieved|Archived from|ed\.\s|vol\.\s)|\bpp?\.?\s*\d+\s*[-–]\s*\d+/i;
+function splitSentences(text) {
+  return String(text).split(/\n+/)
+    .flatMap(p => p.split(/(?<=[.!?])\s+(?=[\p{Lu}(“"'\d])/u))
+    .map(s => s.trim())
+    .filter(s => {
+      if (s.length < 26 || s.length > 480) return false;
+      if (CITATION.test(s)) return false;
+      /* A question is never an answer. Asked who invented the telephone,
+         the best-scoring line was a section heading, "Who Really
+         Invented The Telephone?" — every keyword, no information. */
+      if (/\?\s*$/.test(s)) return false;
+      /* Etymology and pronunciation notes are dictionary apparatus, not
+         statements about the world. "The term is derived from Ancient
+         Greek: τῆλε, romanized: tēle, lit." mentions the subject, reads
+         like a definition and answers nothing anyone asked. */
+      if (/\bromanized:|\bIPA[:\s]|\blit\.\s|\bpronounced\b|\betymolog|\bderived from (?:Ancient|Old|Latin|Greek|Middle)\b/i.test(s)) return false;
+      /* Search snippets start wherever the match did, so the first piece
+         is usually the tail of a sentence: "of the iPhone, succeeding
+         the iPhone 15 Pro...". A fragment reads as a broken answer. */
+      if (/^[a-z]/.test(s)) return false;
+      return true;
+    });
+}
+
+/* How tightly the question's own terms sit together in the sentence.
+   Bag-of-words scores "The Australian Capital Territory ... is an
+   internal territory of Australia" and "Canberra is the capital city of
+   Australia" identically — both contain every term. The distance
+   between those terms is what says only one of them is about the
+   capital of Australia. */
+function proximity(words, qset) {
+  if (qset.size < 2) return 0;
+  const at = new Map();
+  words.forEach((w, i) => { if (qset.has(w)) { if (!at.has(w)) at.set(w, []); at.get(w).push(i); } });
+  if (!at.size) return 0;
+  /* Scaled by coverage rather than gated on it. Returning zero whenever
+     a term was missing punished a sentence twice for the same absence,
+     once through keyword overlap and again here — which is how "The
+     value 299,792,458 metres per second..." lost by three thousandths
+     to a sentence that says light is not exceeded. */
+  const cover = at.size / qset.size;
+  if (at.size < 2) return cover * 0.5;
+  const lists = [...at.values()];
+  let best = Infinity;
+  for (const anchor of lists[0]) {
+    let lo = anchor, hi = anchor;
+    for (let k = 1; k < lists.length; k++) {
+      let near = lists[k][0];
+      for (const p of lists[k]) if (Math.abs(p - anchor) < Math.abs(near - anchor)) near = p;
+      lo = Math.min(lo, near); hi = Math.max(hi, near);
+    }
+    best = Math.min(best, hi - lo);
+  }
+  return best === Infinity ? 0 : cover * Math.max(0, 1 - best / 15);
+}
+const sentOverlap = (a, b) => {
+  const A = new Set(tok(a).map(stem)), B = new Set(tok(b).map(stem));
+  if (!A.size || !B.size) return 0;
+  return [...A].filter(w => B.has(w)).length / Math.min(A.size, B.size);
+};
+
+/* "Who is the president of France" is a question about now. An article
+   about the presidency contains a great many true sentences about other
+   moments — "A 1962 referendum held at the request of President Charles
+   de Gaulle..." names a president, mentions France, and answers nothing.
+   A sentence that opens by dating itself is talking about the past; one
+   that says "current" is talking about now. Only applied when the
+   question is itself in the present tense, so "who founded Google" is
+   not penalised for being about 1998. */
+const NOW_WORDS = /\b(current(ly)?|incumbent|present(ly)?|nowadays|as of|to date|is now)\b/i;
+const PAST_FRAME = /^(?:in|on|during|by|after|before|a|an|the)?\s*\b(?:1[0-9]{3}|20[0-1][0-9])\b|^\S+\s+(?:1[0-9]{3}|20[0-1][0-9])\b|\b(?:formerly|historically|at the time|no longer|until\s+(?:1[0-9]{3}|20[0-9]{2}|his|her|then))\b/i;
+const PRESENT_Q = /\b(is|are|am)\b/i;
+const PAST_Q = /\b(was|were|did|used to|founded|created|invented|wrote|discovered|built|happened|began|started)\b/i;
+
 function webAnswer(question, search) {
-  const qset = new Set(tok(question).filter(w => !STOP.has(w) && w.length > 2).map(stem));
+  const qset = contentSet(question);
   const qv = sentVec(tok(question));
+  const shape = answerShape(question);
+  const nowQ = PRESENT_Q.test(question) && !PAST_Q.test(question);
   const scored = [];
+
   for (const r of search.results) {
-    for (const c of (r.chunks && r.chunks.length ? r.chunks : [r.snippet])) {
-      const words = tok(c).map(stem);
-      const kw = qset.size ? words.filter(w => qset.has(w)).length / qset.size : 0;
+    const rr = 1 / (1 + 0.6 * Math.max(0, (r.rank || 1) - 1));
+    /* the query-matched snippet first: it is the part of the page the
+       search engine thought was about this question, so a sentence in
+       it starts ahead of the same sentence found anywhere else */
+    /* Position counts within each section rather than across the pool.
+       An article's opening sentence is often the one that states the
+       fact outright, and it should not be buried simply because the
+       matched snippet was listed first. */
+    const pool = [];
+    if (r.match) splitSentences(r.match).forEach((s, i) => pool.push({ s, matched: 1, pos: i }));
+    splitSentences(r.snippet).forEach((s, i) => pool.push({ s, matched: 0, pos: i }));
+    const seen = new Set();
+    for (const { s, matched, pos } of pool) {
+      const k = s.slice(0, 60).toLowerCase();
+      if (seen.has(k)) continue;
+      seen.add(k);
+      /* Sentences inside an article are about that article whether or
+         not they name it. "It is 330 metres tall" contains neither
+         "Eiffel" nor "tower", and scored zero on both keyword overlap
+         and proximity against "how tall is the Eiffel Tower" — so a
+         sentence about visitor numbers, which does name it, won. The
+         title is prepended so every sentence in a result carries its
+         subject, which puts them on equal footing and lets the terms
+         that actually discriminate decide. */
+      const words = tok(r.title + ' ' + s).map(stem);
+      const kw = qset.size ? Math.min(1, words.filter(w => qset.has(w)).length / qset.size) : 0;
       let sem = 0;
-      const cv = sentVec(tok(c));
-      if (qv && cv) for (let d = 0; d < DIM; d++) sem += qv[d] * cv[d];
-      scored.push({ c, r, score: 0.55 * Math.max(0, sem) + 0.3 * Math.min(1, kw) + 0.15 * r.reliability.score });
+      const sv = sentVec(tok(s));
+      if (qv && sv) for (let d = 0; d < DIM; d++) sem += qv[d] * sv[d];
+      const fits = shapeHit(shape, s, r);
+      const prox = proximity(words, qset);
+      const early = Math.max(0, 1 - pos * 0.1);
+      /* Semantic closeness is the lightest term deliberately: across
+         candidate sentences drawn from articles the search already
+         judged relevant it sits between 0.86 and 0.93 and separates
+         almost nothing, while the rank it arrived at separates a great
+         deal. Weighting it heavily let a sentence from the third result
+         outscore the answer in the first. */
+      const now = nowQ ? (NOW_WORDS.test(s) ? 1 : PAST_FRAME.test(s) ? -1 : 0) : 0;
+      const score = 0.10 * Math.max(0, sem) + 0.16 * kw + 0.10 * prox + 0.24 * fits
+                  + 0.05 * matched + 0.19 * rr + 0.05 * r.reliability.score
+                  + 0.05 * early + 0.06 * now;
+      scored.push({ s, r, score, fits, why: WEBCFG.debug ? { sem, kw, prox, fits, matched, rr, early, now } : undefined });
     }
   }
+  if (!scored.length) return null;
   scored.sort((a, b) => b.score - a.score);
-  const best = scored.slice(0, 2);
-  if (!best.length) return null;
-  const body = best.map(b => b.c.split(/(?<=[.!?])\s+/).slice(0, 3).join(' ')).join('\n\n');
+
+  /* One good sentence beats three mediocre ones. Others are added only
+     while they say something the first did not. */
+  const best = scored[0];
+  const out = [best.s];
+  let len = best.s.length;
+  for (const c of scored.slice(1)) {
+    if (out.length >= 3 || len > 400) break;
+    if (out.some(o => sentOverlap(o, c.s) > 0.55)) continue;
+    if (c.score < best.score * 0.55) break;
+    out.push(c.s); len += c.s.length;
+  }
+
   const cites = [...new Map(search.results.map(r => [r.url || r.title, r])).values()].slice(0, WEBCFG.maxSources);
-  const conf = Math.min(0.9, 0.35 + 0.35 * best[0].score + 0.2 * (search.agreement && search.agreement.agreement > 0.2 ? 1 : 0));
+  const conf = Math.min(0.92, 0.30 + 0.34 * best.score + 0.12 * best.fits
+                             + 0.14 * (search.agreement && search.agreement.agreement > 0.2 ? 1 : 0));
   return {
-    say: body,
+    say: out.join(' '),
+    shape: shape ? shape.k : null,
+    /* the developer panel shows why this sentence won and the others did not */
+    debug: WEBCFG.debug ? scored.slice(0, 8).map(x => ({ score: +x.score.toFixed(3), title: x.r.title, s: x.s.slice(0, 90), ...x.why })) : undefined,
     sources: cites.map(r => ({ title: r.title, url: r.url, host: r.reliability.host, band: relBand(r.reliability.score), label: r.reliability.label })),
     agreement: search.agreement,
     cached: !!search.cached,
@@ -3026,7 +3373,7 @@ async function replyAsync(text,onStage){
   r.route=r.route||routeOf(r);
 
   const answered=r.intent!=='none'&&!r.err;
-  const need=(typeof webNeeded==='function')?webNeeded(text,r.conf||0,answered):null;
+  const need=(typeof webNeeded==='function')?webNeeded(text,r.conf||0,answered,r.say):null;
   /* The web has nothing to say about how many parameters this app has,
      so questions about the app itself never leave the device. Everything
      else defers to the strength of the freshness signal rather than to

@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content" />
 <meta name="theme-color" content="#080B14" />
 <meta name="apple-mobile-web-app-capable" content="yes" />
 <meta name="mobile-web-app-capable" content="yes" />
@@ -4238,11 +4238,31 @@ const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;',
    The keyboard does not resize the window on iOS, it covers it. Tracking
    visualViewport is the only way the input stays above it. */
 const vv = window.visualViewport;
+/* Pure so it can be checked without a keyboard.
+
+   `innerHeight` is the layout viewport and does not change when the
+   keyboard appears; `vv.height` is what is actually visible above it.
+   Shrinking to vv.height is the whole fix — the app then ends exactly
+   where the keyboard begins.
+
+   The earlier version also shifted the app up by the height of the
+   keyboard, which is the one thing it must never do. With a 852pt
+   window and a 460pt visible strip it translated the app up by 392pt,
+   so everything above the composer went off the top of the screen and
+   what you were typing went with it. The only case that needs a shift
+   is `offsetTop` — the visual viewport scrolled down within the layout
+   viewport, as it does mid-animation — and that shift is downwards. */
+function viewportFit(innerH, vvH, vvTop) {
+  return { h: vvH || innerH, y: Math.max(0, vvTop || 0) };
+}
 function fitViewport() {
-  const h = vv ? vv.height : window.innerHeight;
-  const off = vv ? Math.max(0, window.innerHeight - vv.height - vv.offsetTop) : 0;
-  $('#app').style.height = h + 'px';
-  $('#app').style.transform = off ? `translateY(-${off}px)` : '';
+  const f = viewportFit(window.innerHeight, vv && vv.height, vv && vv.offsetTop);
+  $('#app').style.height = f.h + 'px';
+  $('#app').style.transform = f.y ? `translateY(${f.y}px)` : '';
+  /* Safari scrolls the document trying to reveal a focused input it
+     thinks is hidden. With the app sized correctly there is nothing to
+     reveal, so undo it. */
+  if (window.scrollY) window.scrollTo(0, 0);
 }
 if (vv) { vv.addEventListener('resize', fitViewport); vv.addEventListener('scroll', fitViewport); }
 window.addEventListener('orientationchange', () => setTimeout(fitViewport, 180));

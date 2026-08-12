@@ -305,6 +305,25 @@ pre.dump{
   border:1px solid var(--line);border-radius:10px;padding:11px;overflow-x:auto;margin:0;
   white-space:pre;
 }
+
+/* the mode bar: present only while a mode is on, and impossible to miss */
+.modeBar{
+  display:flex;align-items:center;gap:9px;
+  margin:0 14px 8px;padding:8px 10px;
+  background:var(--panel2);border:1px solid var(--line);
+  border-left:3px solid var(--accent);border-radius:9px;
+  font-size:13px;color:var(--dim);
+}
+.modeBar[hidden]{display:none!important}
+.modeDot{width:7px;height:7px;border-radius:50%;background:var(--accent);flex:none;
+  animation:modePulse 2s ease-in-out infinite}
+@keyframes modePulse{0%,100%{opacity:1}50%{opacity:.35}}
+#modeText{flex:1;min-width:0}
+#modeOff{
+  flex:none;background:none;border:1px solid var(--line);color:var(--dim);
+  border-radius:7px;padding:4px 10px;font:inherit;font-size:12px;cursor:pointer;
+}
+#modeOff:active{background:var(--panel)}
 </style>
 </head>
 <body>
@@ -339,6 +358,13 @@ pre.dump{
   <div id="activity" class="activity" hidden><span class="pulse"></span><span id="actText">Thinking…</span></div>
 
   <div class="dock" id="dock"></div>
+
+  <!-- A mode is never on without this showing. The whole reason modes are
+       explicit is that an invisible one is indistinguishable from a bug. -->
+  <div id="modeBar" class="modeBar" hidden>
+    <span class="modeDot"></span><span id="modeText"></span>
+    <button type="button" id="modeOff" aria-label="Leave this mode">Leave</button>
+  </div>
 
   <form class="entry" id="entry" autocomplete="off">
     <textarea id="in" rows="1" placeholder="Ask anything…" enterkeyhint="send"></textarea>
@@ -823,7 +849,21 @@ function factDrop(subject){return memForget(subject)}
 /* ---- conversation context --------------------------------------------- */
 /* Small on purpose: the last thing we were talking about, the last few
    entities, and what was said. That is enough to resolve "it". */
-const CTX={topic:'',entity:'',entities:[],lastIntent:'',lastSay:'',lastEntry:null,turn:0};
+const CTX={topic:'',entity:'',entities:[],lastIntent:'',lastSay:'',lastEntry:null,turn:0,factTurn:-9};
+
+/* Explicit modes.
+   Almost everything here is inferred: whether a sentence is a
+   correction, whether a question needs the web, which stored fact "it"
+   refers to. Inference that persists silently is indistinguishable from
+   a bug — correcting one answer left every later message beginning
+   "no" or "actually" being read as another correction, which reads
+   exactly like a mode nobody asked to enter and cannot leave.
+
+   So a mode is now something you turn on by name. It lasts one turn
+   unless locked, the UI shows it while it is on, and /exit ends it. */
+const MODE={name:null,locked:false};
+function modeSet(name,locked){MODE.name=name||null;MODE.locked=!!locked;return MODE}
+function modeClear(){MODE.name=null;MODE.locked=false}
 function ctxNote(o){
   CTX.turn++;
   if(o.entity){CTX.entity=o.entity;CTX.topic=o.entity;
@@ -2961,7 +3001,7 @@ const OWNED_IF_CONTEXT=new Set(['clarify','repeat','summarise','rewrite','contra
 const ownsTurn=i=>OWNED.has(i)||(OWNED_IF_CONTEXT.has(i)&&!!CTX.lastSay);
 
 function ctxReset(){CTX.topic='';CTX.entity='';CTX.entities=[];CTX.lastIntent='';CTX.lastSay='';
-  CTX.lastEntry=null;CTX.turn=0;CTX.quiz=null;CTX.lastInput='';CTX.lastFact=null;CTX.project='';CTX.ns='user'}
+  CTX.lastEntry=null;CTX.turn=0;CTX.quiz=null;CTX.lastInput='';CTX.factTurn=-9;CTX.lastFact=null;CTX.project='';CTX.ns='user'}
 /* Short-term context expires with the conversation; what was learned does
    not. This clears both, and is only for tests — nothing in the app calls
    it, because forgetting everything on a new conversation would defeat
@@ -2987,7 +3027,8 @@ const stamp=k=>{PERF[k]=+(performance.now()-PERF._t).toFixed(2);PERF._t=performa
 function confBand(c){return c>=0.85?'VERY HIGH':c>=0.65?'HIGH':c>=0.45?'MEDIUM':c>=0.2?'LOW':'UNKNOWN'}
 
 function reply(text){
-  const rawIn=String(text).trim();
+  let rawIn=String(text).trim();
+  let forced=null;
   if(!rawIn)return{say:'Say something and I will have a go.',intent:'none',conf:0};
   PERF._t=performance.now();for(const k in PERF)if(k!=='_t')delete PERF[k];
 
@@ -3023,18 +3064,33 @@ function reply(text){
       if(got&&got.action==='added'&&r.intent!=='remember'&&r.intent!=='correction'){
         r.say+=`\n\n(Filed that: ${got.rec.s} ${relPhrase(got.rec.r)} ${got.rec.o}. Say "forget ${got.rec.s}" if you would rather I did not.)`;
         r.grew=true}
-      if(got&&got.rec){CTX.lastFact=got.rec.id;
+      if(got&&got.rec){CTX.factTurn=CTX.turn;CTX.lastFact=got.rec.id;
         /* the thing just taught is what the next "it" means, ahead of
            whatever the knowledge base happened to match */
         r.entity=got.rec.s}}
     ctxNote({intent:r.intent,say:r.say,entity:r.entity,entry:r.entry});
     CTX.lastInput=rawIn;
-    if(r.memId)CTX.lastFact=r.memId;
+    if(r.memId){CTX.factTurn=CTX.turn;CTX.lastFact=r.memId}
     if(r.memId)r.mid=r.memId;
+    if(forced&&forced.forceWeb)r.forceWeb=1;
+    if(forced&&forced.forceLocal)r.forceLocal=1;
     delete r.entity;delete r.entry;delete r.memId;delete r.noLearn;return r};
 
-  /* developer commands, before anything can mistake them for English */
-  if(rawIn.charAt(0)==='/'){const c=memCommand(rawIn);if(c)return Object.assign(c,{noLearn:1})}
+  /* commands, before anything can mistake them for English */
+  if(rawIn.charAt(0)==='/'){
+    const c=slashCommand(rawIn)||memCommand(rawIn);
+    /* "/web who won" carries a question: keep the flag, drop the slash,
+       and let the rest of the cascade answer it normally */
+    if(c&&c.rewrite){forced=c;rawIn=c.rewrite;
+      const s2=despell(rawIn);t=s2.text.length?s2.text:rawIn;low=t.toLowerCase()}
+    else if(c)return Object.assign(c,{noLearn:1})}
+
+  /* an explicit mode beats every inference below it */
+  if(MODE.name==='correct'&&!forced){
+    const r=applyCorrection(rawIn,rawIn);
+    return out(Object.assign(r,{route:'memory'}))}
+  if(MODE.name==='web')forced={forceWeb:true};
+  if(MODE.name==='local')forced={forceLocal:true};
 
   /* a namespace named at the front of the sentence governs this turn */
   {const ns=detectNamespace(rawIn);
@@ -3098,14 +3154,52 @@ function reply(text){
     const rec=memPut(key,val);
     return out({say:`Noted — your ${m[1].trim()} is ${val}. I'll keep that${rec.c!=='general'?` under ${rec.c}`:''}.`,intent:'remember',conf:1,grew:true,entity:m[1].trim()})}
 
+  /* a sign-off that happens to open with "no" is a sign-off */
+  if(/^(?:no\s+)?(?:thanks?|thank you|cheers|ta)\b(?:[,\s]*(?:that'?s|that is)\s+(?:all|it|everything))?[.!]*$/i.test(low))
+    return out({say:'Any time.',intent:'thanks',conf:0.95,noLearn:1});
+
   /* 3. corrections. A correction has to be able to overwrite a stored fact,
         but it must not silently overwrite verified knowledge — so the two
         cases are handled differently and the difference is stated. */
-  const CORRECT=/^(?:no+|nope|nah|wrong|incorrect|actually|correction|thats wrong|that's wrong|thats incorrect|that's incorrect|youre wrong|you're wrong|you are wrong|you got that wrong|thats not right|that's not right|thats not accurate|that's not accurate|you made a mistake|not quite)\b[,:\s-]*(.*)$/;
+  /* "actually" is off this list on purpose. It opens a correction about
+     as often as it opens an ordinary sentence — "actually what is
+     python" is a question, not a correction — and treating it as one
+     stored the question as the corrected value.
+
+     The freshness rule matters more. A bare value like "no, Rust" is
+     applied to the last fact asserted, and nothing checked how long ago
+     that was, so every later message starting "no" was still being
+     applied to a fact from much earlier in the conversation. From the
+     outside that is a correction mode that turned itself on and would
+     not turn off. A correction now has to follow the thing it corrects. */
+  const CORRECT=/^(?:no+|nope|nah|wrong|incorrect|correction|thats wrong|that's wrong|thats incorrect|that's incorrect|youre wrong|you're wrong|you are wrong|you got that wrong|thats not right|that's not right|thats not accurate|that's not accurate|you made a mistake|not quite)\b[,:\s-]*(.*)$/;
   m=low.match(CORRECT);
+  if(!m&&/^actually\b/i.test(low)){
+    /* "actually X is Y" is a correction; "actually, what is X" is not */
+    const after=t.trim().replace(/^actually\b[,:\s-]*/i,'');
+    if(after&&!/^(?:what|who|when|where|which|why|how|is|are|do|does|did|can|could|tell|show|give)\b/i.test(after)&&parseTriple(after))
+      m=[null,after.toLowerCase()]}
   if(m){
     const rest=t.trim().slice(t.trim().length-m[1].length).trim().replace(/^(?:it'?s|its|it is|the answer is|i said|i meant)\s+/i,'');
-    return out(applyCorrection(rest,t))}
+    /* a question is never a correction, whatever it opens with */
+    const asks=/\?\s*$/.test(rest)||/^(?:what|who|when|where|which|why|how)\b/i.test(rest);
+    /* "no", "no that's wrong" — a denial with no replacement in it */
+    const bare=!rest||/^(?:that'?s?\s+|thats\s+|it'?s\s+)?(?:wrong|incorrect|not right|not correct|not true|false|a mistake)\b/i.test(rest);
+    const fresh=CTX.turn-CTX.factTurn<=1&&CTX.lastFact&&IX.id.has(CTX.lastFact);
+    /* Otherwise this is only a correction if it carries one. "no thanks
+       that is all" opens the same way and is not a correction of
+       anything, so it falls through to ordinary conversation instead of
+       being forced into memory. */
+    /* A replacement value is short and names a thing — "no, Go". A
+       sentence is something else: "no thanks that is all" follows an
+       answer just as closely and corrects nothing. */
+    const valueish=rest&&tok(rest).length<=4;
+    /* "no thanks, that is all" opens exactly like a correction and is a
+       goodbye. It even parses as a triple — "thanks that" / is / "all" —
+       which is how it reached memory in the first place. */
+    const chatty=/^(?:thanks?|thank you|ok|okay|never ?mind|forget it|nothing|stop|that'?s all|that is all|all good|i'?m good|cheers|bye|worries|problem|need|thanks anyway)\b/i.test(rest);
+    if(!asks&&!chatty&&(bare||parseTriple(rest)||(fresh&&valueish)))
+      return out(applyCorrection(bare?'':rest,t))}
 
   /* 4. recall — stored memory and facts beat the shipped knowledge base */
   const rec=tryRecall(t,low);stamp('memory');
@@ -3373,7 +3467,9 @@ async function replyAsync(text,onStage){
   r.route=r.route||routeOf(r);
 
   const answered=r.intent!=='none'&&!r.err;
-  const need=(typeof webNeeded==='function')?webNeeded(text,r.conf||0,answered,r.say):null;
+  let need=(typeof webNeeded==='function')?webNeeded(text,r.conf||0,answered,r.say):null;
+  /* an explicit /web is not a guess and does not need one */
+  if(r.forceWeb)need={reason:'you asked me to look it up',force:true,strong:true};
   /* The web has nothing to say about how many parameters this app has,
      so questions about the app itself never leave the device. Everything
      else defers to the strength of the freshness signal rather than to
@@ -3382,7 +3478,9 @@ async function replyAsync(text,onStage){
     'conscious','learnhow','capability','backup','install','brain','count','help','greet','bye',
     'thanks','joke','motivate','apologise','insult','howareyou','memory','teachphrase','forgetit']);
   const selfish=SELFISH.has(r.intent);
-  const allow=need&&!selfish&&r.intent!=='math'&&r.intent!=='wordproblem'&&
+  const allow=r.forceLocal?false:
+              r.forceWeb?true:
+              need&&!selfish&&r.intent!=='math'&&r.intent!=='wordproblem'&&
               (need.strong||need.force||!OWNED.has(r.intent));
   if(allow){
     const tW=performance.now();
@@ -3516,8 +3614,14 @@ function applyCorrection(rest,full){
   const tri=parseTriple(clean);
   if(tri)return correctionResult(memAdd({s:tri.s,r:tri.r,o:tri.o,src:'correction',cf:CF.STATED},{text:clean}));
 
-  /* a bare value: "no, Rust" — apply it to whatever we last asserted */
-  const last=CTX.lastFact;
+  /* A bare value — "no, Rust" — is applied to whatever was last
+     asserted, and that is the one path here that can write nonsense into
+     memory. It only holds while the thing being corrected is still the
+     thing on screen: nothing checked that before, so a message opening
+     with "no" was still being written onto a fact from much earlier in
+     the conversation, which is what made this feel like a correction
+     mode that would not switch off. */
+  const last=CTX.turn-CTX.factTurn<=1?CTX.lastFact:null;
   if(last&&IX.id.has(last)){
     const r=IX.id.get(last);
     return correctionResult(memAdd({s:r.s,r:r.r,o:clean,ns:r.ns,src:'correction',cf:CF.STATED},{text:r.s+' '+r.r+' '+clean}))}
@@ -3527,7 +3631,7 @@ function applyCorrection(rest,full){
 
 function correctionResult(res){
   if(!res.rec)return{say:'I could not work out what to correct.',intent:'correction',conf:0.5};
-  const r=res.rec;CTX.lastFact=r.id;
+  const r=res.rec;CTX.factTurn=CTX.turn;CTX.lastFact=r.id;
   if(res.action==='updated')
     return{say:`Corrected — ${r.s} ${relPhrase(r.r)} ${r.o}, not ${res.was}. I have kept the old value in the record's history and I will use the new one from now on.`,
       intent:'correction',conf:0.98,grew:true,entity:r.s};
@@ -3557,7 +3661,7 @@ function tryRecall(t,low){
   const strong=top.score>=1.15||(top.score>=0.85&&rels.length&&rels.includes(top.rec.r));
   if(!strong)return multiHopAnswer(t,low,rels);
 
-  memTouch(top.rec);CTX.lastFact=top.rec.id;
+  memTouch(top.rec);CTX.factTurn=CTX.turn;CTX.lastFact=top.rec.id;
   if(/\bwhat (?:kind|type|sort) of\b/.test(low)&&top.dir!=='back'){
     const cls=hyperChain(top.rec.o,2);
     if(cls.length)return{say:`${cap(top.rec.o)} — which is a ${cls[0]}.`,
@@ -3576,7 +3680,7 @@ function multiHopAnswer(t,low,rels){
   for(const s of extractSubjects(t)){
     const hop=memHopType(s,rels);
     if(!hop)continue;
-    memTouch(hop.rec);CTX.lastFact=hop.rec.id;
+    memTouch(hop.rec);CTX.factTurn=CTX.turn;CTX.lastFact=hop.rec.id;
     const via=hop.path.length?`\n\nI got there by ${hop.path.map(p=>`${p.s} ${relPhrase(p.r)} ${p.o}`).join(', then ')}.`:'';
     const typed=/\bwhat (?:kind|type|sort) of\b/.test(low)&&hop.type
       ? `${cap(hop.rec.o)} — which is a ${hop.type}.`
@@ -3704,6 +3808,78 @@ function learnIntentCorrection(low){
   const redo=reply(CTX.lastInput);
   return{say:`Understood — I have learned that "${CTX.lastInput}" means ${intent}, and I will lean that way next time.\n\n${redo.say}`,
     intent:intent,conf:Math.max(0.7,redo.conf||0),grew:true}}
+
+/* ---- commands -------------------------------------------------------
+   A command says what to do instead of leaving it to be guessed from
+   the wording. Every one of these was previously inferred, and every
+   inference is occasionally wrong in a way that is hard to see from the
+   outside. */
+const COMMANDS=[
+  ['/help','list these'],
+  ['/correct [text]','fix my last answer — with no text, the next thing you send is the correction'],
+  ['/remember <fact>','store a fact exactly as given'],
+  ['/forget <thing>','drop what is stored about it'],
+  ['/recall <thing>','say what is stored about it'],
+  ['/web <question>','answer from the web'],
+  ['/local <question>','answer without the web'],
+  ['/mode','say which mode is on'],
+  ['/exit','turn the current mode off'],
+  ['/facts','everything you have taught me'],
+  ['/memory','list · search <term> · stats · delete <id> · conflicts · clear'],
+];
+const MODE_HELP={
+  correct:'Correction mode: the next thing you send replaces my last answer. /exit to leave.',
+  web:'Web mode: the next question goes to the web. /exit to leave.',
+  local:'Offline mode: the next question is answered without the web. /exit to leave.',
+};
+
+function slashCommand(raw){
+  const parts=String(raw).trim().split(/\s+/);
+  const cmd=parts[0].toLowerCase();
+  const arg=parts.slice(1).join(' ').trim();
+
+  if(cmd==='/help'||cmd==='/commands'||cmd==='/?')
+    return{say:'Commands:\n\n'+COMMANDS.map(([c,d])=>`  ${c}\n      ${d}`).join('\n')+
+      '\n\nEverything else is ordinary conversation — commands are only for when you want to be certain, not the normal way to talk to me.',
+      intent:'help',conf:1};
+
+  if(cmd==='/exit'||cmd==='/cancel'||cmd==='/normal'||cmd==='/done'){
+    const was=MODE.name;modeClear();
+    return{say:was?`Left ${was} mode.`:'No mode was on.',intent:'mode',conf:1}}
+
+  if(cmd==='/mode')
+    return{say:MODE.name?MODE_HELP[MODE.name]||`${MODE.name} mode is on.`:'No mode is on — I am reading what you send as ordinary conversation.',intent:'mode',conf:1};
+
+  if(cmd==='/correct'||cmd==='/fix'){
+    if(arg)return Object.assign(applyCorrection(arg,arg),{route:'memory'});
+    modeSet('correct',true);
+    return{say:MODE_HELP.correct,intent:'mode',conf:1}}
+
+  if(cmd==='/remember'||cmd==='/store'){
+    if(!arg)return{say:'Give me the fact: /remember Nova is my project.',intent:'mode',conf:1};
+    return Object.assign(storeStatement(arg,'remember')||{say:'I could not parse that into a fact. Try "<thing> is <value>".',intent:'remember',conf:0.5},{route:'memory'})}
+
+  if(cmd==='/forget'){
+    if(!arg)return{say:'Give me what to drop: /forget Nova.',intent:'mode',conf:1};
+    return Object.assign(memForget(arg),{route:'memory'})}
+
+  if(cmd==='/recall'||cmd==='/what'){
+    if(!arg)return{say:'Give me what to look up: /recall Nova.',intent:'mode',conf:1};
+    const r=tryRecall(arg,arg.toLowerCase());
+    return r?Object.assign(r,{route:'memory'}):{say:`Nothing stored about "${arg}".`,intent:'recall',conf:0.9}}
+
+  if(cmd==='/web'||cmd==='/search'){
+    modeSet('web',!arg);
+    return arg?{say:'',intent:'passthrough',conf:1,rewrite:arg,forceWeb:true}
+              :{say:MODE_HELP.web,intent:'mode',conf:1}}
+
+  if(cmd==='/local'||cmd==='/offline'){
+    modeSet('local',!arg);
+    return arg?{say:'',intent:'passthrough',conf:1,rewrite:arg,forceLocal:true}
+              :{say:MODE_HELP.local,intent:'mode',conf:1}}
+
+  return null;
+}
 
 /* ---- developer commands ------------------------------------------------ */
 function memCommand(raw){
@@ -4228,6 +4404,26 @@ function activity(text) {
   $('#actText').textContent = text; a.hidden = false; toBottom();
 }
 
+/* ---- modes ------------------------------------------------------------
+   Shown whenever one is on, with a way out that is not a command you
+   have to remember. */
+const MODE_LABEL = {
+  correct: 'Correction mode — what you send replaces my last answer',
+  web: 'Web mode — questions go to the web',
+  local: 'Offline mode — the web is not consulted',
+};
+function updateMode() {
+  const on = typeof MODE !== 'undefined' && MODE.name;
+  $('#modeBar').hidden = !on;
+  if (on) $('#modeText').textContent = MODE_LABEL[MODE.name] || MODE.name + ' mode';
+  $('#in').placeholder = on && MODE.name === 'correct' ? 'Type the correction…' : 'Ask anything…';
+}
+$('#modeOff').addEventListener('click', () => {
+  if (typeof modeClear === 'function') modeClear();
+  updateMode();
+  flash('Mode off');
+});
+
 /* ---- send ------------------------------------------------------------- */
 async function submit() {
   const t = $('#in').value.trim(); if (!t) return;
@@ -4254,7 +4450,7 @@ async function submit() {
     sources: r.web ? r.web.sources : null, cached: r.web ? r.web.cached : false,
     timing: r.timing,
   });
-  save(); syncChat(); renderChat(); toBottom();
+  save(); syncChat(); renderChat(); toBottom(); updateMode();
   if (r.grew) flash('Learned — ' + params().total.toLocaleString() + ' features');
 }
 $('#entry').addEventListener('submit', e => { e.preventDefault(); submit(); });

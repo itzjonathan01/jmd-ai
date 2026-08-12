@@ -2728,6 +2728,41 @@ function rank(results, query) {
   }).sort((a, b) => b.score - a.score);
 }
 
+/* A genuine disagreement is two sources giving different values for the
+   same measured thing. Word overlap cannot see that; a number followed
+   by the same unit in two sources can. Deliberately narrow — it reports
+   only what it can actually demonstrate, and stays quiet otherwise. */
+const NUM_UNIT = /\b(\d[\d,]*(?:\.\d+)?)\s*(%|km|cm|mm|m|ft|feet|miles?|metres?|meters?|kg|kilograms?|tonnes?|pounds?|lbs?|years?|people|inhabitants|million|billion|trillion)\b/gi;
+function numericConflicts(results) {
+  const byUnit = new Map();
+  for (const r of results) {
+    const host = r.reliability ? r.reliability.host : hostOf(r.url);
+    const text = String(r.match || r.snippet || '');
+    NUM_UNIT.lastIndex = 0;
+    let m;
+    while ((m = NUM_UNIT.exec(text))) {
+      const unit = m[2].toLowerCase().replace(/s$/, '');
+      const value = parseFloat(m[1].replace(/,/g, ''));
+      if (!isFinite(value)) continue;
+      if (!byUnit.has(unit)) byUnit.set(unit, []);
+      byUnit.get(unit).push({ host, value, text: m[0] });
+    }
+  }
+  const out = [];
+  for (const [unit, seen] of byUnit) {
+    for (let i = 0; i < seen.length; i++) for (let j = i + 1; j < seen.length; j++) {
+      const a = seen[i], b = seen[j];
+      if (a.host === b.host) continue;                    // one source, not two
+      const big = Math.max(a.value, b.value) || 1;
+      /* more than a fifth apart is a disagreement; closer than that is
+         rounding, or two sources measuring slightly different things */
+      if (Math.abs(a.value - b.value) / big > 0.2)
+        out.push({ what: unit, a: { host: a.host, value: a.text }, b: { host: b.host, value: b.text } });
+    }
+  }
+  return out.slice(0, 2);
+}
+
 /* Do the sources agree? Two saying the same thing is worth far more than
    one saying it loudly. */
 function verify(results) {
@@ -2740,11 +2775,30 @@ function verify(results) {
     total += inter / uni; pairs++;
   }
   const agreement = pairs ? total / pairs : 0;
+
+  /* Low word overlap is not disagreement. Three encyclopedia articles
+     covering different aspects of one subject share few words and
+     contradict nothing, and announcing that they "do not agree with
+     each other much" is a claim about the facts that the measurement
+     does not support. A real disagreement is two sources giving
+     different values for the same thing, so look for that instead and
+     say what it is. */
+  const conflicts = numericConflicts(results.slice(0, 3));
+  const hosts = new Set(results.slice(0, 3).map(r => hostOf(r.url)).filter(Boolean));
+
+  if (conflicts.length) {
+    const c = conflicts[0];
+    return { agreement, conflicts,
+      note: `Those sources disagree on one point: ${c.a.host} gives ${c.a.value} ${c.what}, ${c.b.host} gives ${c.b.value}.` };
+  }
   return {
-    agreement,
+    agreement, conflicts: [],
     note: agreement >= 0.25 ? 'The sources broadly agree.'
-        : agreement >= 0.12 ? 'The sources overlap only partly, so treat the detail with some caution.'
-        : 'The sources do not agree with each other much — I would check this one yourself.',
+        /* only worth flagging thin overlap when they are genuinely
+           independent sources; several pages from one publisher
+           covering one subject are not cross-confirmation either way */
+        : hosts.size > 1 ? 'These cover different parts of the subject rather than confirming each other, so treat the detail with some caution.'
+        : '',
   };
 }
 
@@ -2799,7 +2853,33 @@ function webStats() {
 /* search -> rank -> sanitise -> chunk -> verify -> summarise. Every stage
    is reported so the activity indicator can show what is really running
    rather than a decorative sequence. */
-async function webSearch(rawQuestion, onStage) {
+/* How good does a result set have to be before it is worth answering
+   from? Below this the honest move is another search, not an answer
+   assembled out of whatever came back. */
+const REL_MIN = 0.34;        // a single result must clear this to be used
+const GOOD_ENOUGH = 0.62;    // best result above this: stop searching
+
+/* Two results are the same story when they point at the same place or
+   say the same thing. Syndicated copy is common and three copies of one
+   article is not three sources. */
+function dedupe(results) {
+  const out = [], seenUrl = new Set(), seenTitle = new Set();
+  for (const r of results) {
+    const u = (r.url || '').replace(/[#?].*$/, '').replace(/\/$/, '');
+    const t = String(r.title || '').toLowerCase().trim();
+    if (u && seenUrl.has(u)) continue;
+    if (t && seenTitle.has(t)) continue;
+    /* near-duplicate body text, which is what syndication looks like */
+    const near = out.find(o => sentOverlap(o.snippet.slice(0, 400), r.snippet.slice(0, 400)) > 0.7);
+    if (near) { near.alsoIn = (near.alsoIn || 0) + 1; continue; }
+    if (u) seenUrl.add(u);
+    if (t) seenTitle.add(t);
+    out.push(r);
+  }
+  return out;
+}
+
+async function webSearch(rawQuestion, onStage, plan) {
   const stage = s => { if (onStage) onStage(s); };
   if (!WEBCFG.enabled) return { ok: false, why: 'web access is switched off in settings' };
   const env = webEnvironment();
@@ -2807,7 +2887,21 @@ async function webSearch(rawQuestion, onStage) {
   if (WEB_BLOCKED) return { ok: false, blocked: true, why: WEB_BLOCKED };
   if (typeof navigator !== 'undefined' && navigator.onLine === false) return { ok: false, why: 'no network connection' };
 
-  const variants = queryVariants(rawQuestion);
+  /* A plan knows what the question is about; without one, fall back to
+     rewriting the sentence. This is the difference between searching for
+     "artificial intelligence developments August 2026" and searching for
+     "the latest major AI development, explain it simply, which sources
+     you used, then remember the main conclusion". */
+  /* Plan-shaped queries are for requests that need them. A plain
+     question already works through the tested rewriter, and running it
+     through the planner turned "what is the current widget standard"
+     into "latest what is the widget standard developments August 2026". */
+  const usePlan = plan && (plan.compound || plan.needsWeb || (plan.recency === 'current' && plan.goal));
+  const variants = (usePlan && typeof planQueries === 'function') ? planQueries(plan) : queryVariants(rawQuestion);
+  /* rank against the subject, not against the instructions wrapped
+     around it, or every result gets marked down for lacking the word
+     "remember" */
+  const rankAgainst = usePlan ? [plan.topicLong, plan.goal || '', plan.subject].filter(Boolean).join(' ') : rawQuestion;
   const key = 'q:' + hashOf(variants[0]);
   if (WEBCFG.cache) {
     const hit = cacheGet(key);
@@ -2815,9 +2909,16 @@ async function webSearch(rawQuestion, onStage) {
   }
 
   const order = WEBCFG.provider === 'auto' ? ['wikipedia', 'duckduckgo'] : [WEBCFG.provider];
-  let results = [], used = [], lastErr = '';
-  stage('searching the web');
-  for (const q of variants) {
+  let results = [], used = [], lastErr = '', tried = [];
+
+  /* One search is enough for "what is a black hole" and nowhere near
+     enough for "the latest major AI development". Complex and
+     time-sensitive questions get several differently-shaped queries,
+     and the loop stops early the moment something good comes back
+     rather than burning the whole budget every time. */
+  const budget = usePlan ? Math.min(4, variants.length) : 1;
+  const runQuery = async q => {
+    tried.push(q);
     for (const name of order) {
       const prov = PROVIDERS[name];
       if (!prov) continue;
@@ -2826,15 +2927,37 @@ async function webSearch(rawQuestion, onStage) {
         const got = await prov.search(q, WEBCFG.maxSources + 2);
         if (got && got.length) { results = results.concat(got); used.push(prov.name); }
       } catch (e) { lastErr = String(e.message || e); WEBDB.stats.failures++; }
-      if (results.length >= WEBCFG.maxSources) break;
+      if (results.length) break;    // one provider answering is enough per query
     }
-    if (results.length) break;      // a variant that works ends the search
+  };
+
+  stage('searching the web');
+  for (let i = 0; i < budget; i++) {
+    await runQuery(variants[i]);
+    if (!results.length) continue;
+    stage(`found ${dedupe(results).length} candidates`);
+    const peek = rank(dedupe(results), rankAgainst);
+    /* good enough to stop; otherwise keep going with a differently
+       shaped query rather than answering from weak evidence */
+    if (peek.length && peek[0].score >= GOOD_ENOUGH) break;
   }
   webSave();
-  if (!results.length) return { ok: false, why: lastErr ? 'the search did not come back (' + lastErr + ')' : 'nothing relevant came back' };
+  if (!results.length) return { ok: false, tried, why: lastErr ? 'the search did not come back (' + lastErr + ')' : 'nothing relevant came back' };
 
   stage('reading sources');
-  const ranked = rank(results, rawQuestion).slice(0, WEBCFG.maxSources);
+  const scored = rank(dedupe(results), rankAgainst);
+  /* The hard filter. A page that merely contains the words is not
+     evidence: asked for the latest AI development, a glossary entry
+     defining "artificial intelligence" matches every keyword and
+     answers nothing. Anything under the floor is dropped and said to
+     have been dropped, rather than quietly padding the answer. */
+  const rejected = scored.filter(r => r.score < REL_MIN)
+                         .map(r => ({ title: r.title, host: r.reliability.host, score: +r.score.toFixed(3) }));
+  const kept = scored.filter(r => r.score >= REL_MIN);
+  if (!kept.length)
+    return { ok: false, tried, rejected, weak: true,
+             why: `nothing relevant enough came back — ${rejected.length} result${rejected.length === 1 ? '' : 's'} were all below the relevance floor` };
+  const ranked = kept.slice(0, WEBCFG.maxSources);
   let blocked = 0;
   for (const r of ranked) {
     const s = sanitise(r.snippet);
@@ -2847,7 +2970,9 @@ async function webSearch(rawQuestion, onStage) {
   stage('checking sources against each other');
   const agree = verify(ranked);
   if (WEBCFG.cache) cachePut(key, variants[0], ranked);
-  return { ok: true, query: variants[0], providers: [...new Set(used)], results: ranked, agreement: agree, blocked };
+  return { ok: true, query: variants[0], tried, rejected, plan: plan || null,
+           providers: [...new Set(used)], results: ranked, agreement: agree, blocked,
+           confidence: ranked[0].score };
 }
 
 /* Turn ranked sources into an answer. Extractive on purpose: this model
@@ -3019,6 +3144,230 @@ function webAnswer(question, search) {
 
 webLoad();
 if (typeof window !== 'undefined') window.addEventListener('online', () => { });
+
+/* ============================================================
+   Layer 3.5: understanding what was actually asked.
+
+   A request is not a search query. Given
+
+     "Search the web for the latest major AI development, explain it
+      simply, tell me which sources you used, then remember the main
+      conclusion."
+
+   the previous rewriter stripped the leading "search the web for" and
+   sent everything after it — instructions and all — to Wikipedia:
+
+     the latest major AI development, explain it simply, which sources
+     you used, then remember the main conclusion.
+
+   Wikipedia obliged with an article about large language models, and
+   internal retrieval, matching on the words "search" and "web", led
+   with its own glossary entry for "search engine". Every stage worked.
+   The thing being searched for was wrong.
+
+   Two mistakes, and they compound:
+
+     1. no separation of COMMAND language from SUBJECT language. "search",
+        "explain", "tell me", "remember" describe what to do; only "the
+        latest major AI development" says what about.
+     2. one message forced into one intent. That message contains four
+        instructions, and answering it means doing four things in order.
+
+   So a request is parsed into a plan: a subject, and a list of tasks
+   over that subject. Everything here is deterministic — clause
+   splitting, a verb table, and noun-phrase extraction. There is no
+   model in this file and it costs about a tenth of a millisecond.
+   ============================================================ */
+
+/* ---- the verbs that mean "do something", not "about something" ------
+   Order matters within a clause: the leading verb decides the task, and
+   whatever follows it is the argument, not the subject of the request. */
+const TASK_VERBS = [
+  { k: 'web',      re: /^(?:please\s+)?(?:can\s+you\s+)?(?:search|look\s*up|google|find|check|browse|fetch|research)\b/i },
+  { k: 'sources',  re: /^(?:please\s+)?(?:tell|show|give|list|name|cite|include|provide)\s+(?:me\s+)?(?:which|what|the|your|all\s+the)?\s*(?:sources?|citations?|links?|references?|urls?)\b/i },
+  { k: 'remember', re: /^(?:please\s+)?(?:remember|save|store|note|keep|memorise|memorize|record)\b/i },
+  { k: 'forget',   re: /^(?:please\s+)?(?:forget|delete|remove|drop)\b/i },
+  { k: 'compare',  re: /^(?:please\s+)?(?:compare|contrast)\b|^(?:what(?:'s| is) the )?difference\b/i },
+  { k: 'explain',  re: /^(?:please\s+)?(?:explain|describe|summarise|summarize|clarify|break\s+(?:it|this|that)\s+down|walk\s+me\s+through)\b/i },
+  { k: 'list',     re: /^(?:please\s+)?(?:list|enumerate)\b/i },
+  { k: 'define',   re: /^(?:please\s+)?define\b/i },
+];
+
+/* A clause that is only an instruction carries no subject of its own —
+   "explain it simply" is about whatever the previous clause was about. */
+const PRONOUN_ONLY = /^(?:it|this|that|them|those|these|the (?:answer|result|topic|conclusion|main conclusion))\b/i;
+
+/* Modifiers on how to answer, not what to answer. */
+const SIMPLY = /\b(?:simply|simple|in simple terms|plain english|plainly|like i'?m five|eli5|briefly|in short|short(?:ly)?|concisely)\b/i;
+const DETAIL = /\b(?:in detail|thoroughly|in depth|at length|comprehensively|fully)\b/i;
+
+/* Abbreviations worth expanding before a search, because the article
+   titles use the long form and the query does not. Deliberately short:
+   a long list of guesses would do more harm than good. */
+const EXPAND = {
+  ai: 'artificial intelligence', ml: 'machine learning', llm: 'large language model',
+  nlp: 'natural language processing', cv: 'computer vision', ar: 'augmented reality',
+  vr: 'virtual reality', iot: 'internet of things', api: 'API', os: 'operating system',
+  gpu: 'GPU', cpu: 'CPU', ev: 'electric vehicle', eu: 'European Union',
+  un: 'United Nations', nasa: 'NASA', who: 'World Health Organization',
+  usa: 'United States', uk: 'United Kingdom', js: 'JavaScript', ts: 'TypeScript',
+  db: 'database', ui: 'user interface', ux: 'user experience',
+};
+
+/* Words that describe the KIND of thing wanted rather than the thing.
+   "the latest major AI development" wants a development in AI; the
+   subject is AI and "development" is the goal. Keeping them apart is
+   what turns one query into several good ones. */
+const GOAL_NOUNS = /\b(development|developments|news|announcement|announcements|breakthrough|breakthroughs|advance|advances|release|releases|update|updates|research|discovery|discoveries|progress|trend|trends|event|events|story|stories|headline|headlines)\b/i;
+const SUPERLATIVE = /\b(latest|newest|most recent|current|biggest|major|significant|important|top|best|leading|main)\b/gi;
+const LEAD_JUNK = /^(?:the|a|an|any|some|about|on|for|regarding|concerning|to|of|in)\s+/i;
+
+/* ---- splitting a request into clauses --------------------------------
+   Splitting on every comma would shred "Guido van Rossum, who created
+   Python". A clause boundary is a comma or conjunction FOLLOWED BY an
+   instruction verb, which is exactly where one task ends and the next
+   begins. */
+function splitClauses(text) {
+  const t = String(text).trim().replace(/\s+/g, ' ');
+  const verb = TASK_VERBS.map(v => v.re.source.replace(/^\^/, '')).join('|');
+  const boundary = new RegExp(
+    /* an explicit sequencer always ends a clause */
+    '\\s*(?:,\\s*)?(?:and\\s+)?(?:then|after\\s+that|next|finally|also|lastly)\\s+' +
+    /* a comma before an instruction verb ends one */
+    '|\\s*,\\s*(?=(?:' + verb + '))' +
+    /* and so does a bare "and" before one — "find X and compare it to Y"
+       is two tasks, while "black holes and neutron stars" is one subject,
+       and requiring an instruction verb after the "and" tells them apart */
+    '|\\s+and\\s+(?=(?:' + verb + '))' +
+    '|\\s*(?:\\.|;)\\s+', 'i');
+  return t.split(boundary).map(s => s.trim().replace(/[.;,]+$/, '')).filter(Boolean);
+}
+
+/* ---- pulling the subject out of a clause -----------------------------
+   Strip the instruction, then strip the words that describe what kind
+   of answer is wanted, and what remains is what the question is about. */
+function subjectOf(clause) {
+  /* the existing rewriter already knows how to take "bro", "rn" and
+     "check online" out of a sentence; reuse it rather than keeping two
+     lists of filler that can drift apart */
+  let s = (typeof webQuery === 'function') ? webQuery(clause) : String(clause);
+  for (const v of TASK_VERBS) s = s.replace(v.re, ' ');
+  s = s.replace(/^\s*(?:the\s+)?(?:web|internet|online)\s+(?:for|about)\b/i, ' ')
+       .replace(/^\s*(?:for|about|on|regarding|up)\b/i, ' ')
+       .replace(/\b(?:for me|please|thanks)\b/gi, ' ')
+       .replace(/\s+/g, ' ').trim();
+  s = s.replace(LEAD_JUNK, '');
+  return s;
+}
+
+/* Expand abbreviations only when they stand alone as words. */
+function expandAbbrev(s) {
+  return String(s).replace(/\b([a-z]{2,4})\b/gi, (m) => {
+    const e = EXPAND[m.toLowerCase()];
+    return e && m.toUpperCase() === m || e && m.length <= 3 ? (e || m) : m;
+  });
+}
+
+/* ---- the plan --------------------------------------------------------
+   Returns null for anything that is a single ordinary question, so the
+   existing cascade handles the common case untouched and only genuinely
+   compound requests pay for this. */
+function parseRequest(text) {
+  const raw = String(text).trim();
+  const clauses = splitClauses(raw);
+
+  const tasks = [];
+  let subject = '', subjectClause = '';
+  for (const c of clauses) {
+    const hit = TASK_VERBS.find(v => v.re.test(c));
+    const kind = hit ? hit.k : 'answer';
+    const arg = subjectOf(c);
+    /* A clause whose argument is only a pronoun refers back to the
+       subject already established — "explain it simply". */
+    const refersBack = !arg || PRONOUN_ONLY.test(arg);
+    if (!refersBack && arg.length > 2 && !subject) { subject = arg; subjectClause = c; }
+    tasks.push({ kind, clause: c, arg: refersBack ? null : arg });
+  }
+  if (!subject && clauses.length) { subject = subjectOf(clauses[0]); subjectClause = clauses[0]; }
+  if (!subject) return null;
+
+  /* recency is read from the clause that carries the subject, not from
+     the instruction to remember something afterwards */
+  const recency = typeof FRESH_WORDS !== 'undefined' && FRESH_WORDS.test(subjectClause) ? 'current' : 'none';
+  const goalMatch = subjectClause.match(GOAL_NOUNS);
+
+  /* the topic is the subject with the goal noun and the superlatives
+     taken out: "the latest major AI development" -> "AI" */
+  let topic = subject.replace(GOAL_NOUNS, ' ').replace(SUPERLATIVE, ' ')
+                     .replace(/\s+/g, ' ').replace(LEAD_JUNK, '').trim();
+  if (!topic) topic = subject.replace(SUPERLATIVE, ' ').replace(/\s+/g, ' ').trim();
+
+  const kinds = new Set(tasks.map(t => t.kind));
+  const plan = {
+    raw,
+    clauses,
+    tasks,
+    subject,
+    topic,
+    topicLong: expandAbbrev(topic),
+    goal: goalMatch ? goalMatch[0].toLowerCase() : null,
+    recency,
+    needsWeb: kinds.has('web'),
+    needsSources: kinds.has('sources'),
+    remember: kinds.has('remember'),
+    explain: SIMPLY.test(raw) ? 'simple' : DETAIL.test(raw) ? 'detailed' : null,
+    compare: kinds.has('compare'),
+    /* compound means more than one thing was asked for, which is when
+       any of this is worth the trouble */
+    compound: tasks.filter(t => t.kind !== 'answer').length > 1 ||
+              (tasks.length > 1 && kinds.size > 1),
+  };
+  return plan;
+}
+
+/* ---- searches from a plan --------------------------------------------
+   One request becomes several differently-shaped queries. Different
+   shapes fail differently: the long form finds articles, the bare topic
+   finds the encyclopedia entry, and the dated form finds anything
+   recent. Ranking sorts out which was right. */
+function planQueries(plan, now) {
+  const d = now || new Date();
+  const month = ['January', 'February', 'March', 'April', 'May', 'June', 'July',
+                 'August', 'September', 'October', 'November', 'December'][d.getMonth()];
+  const year = d.getFullYear();
+  const t = plan.topicLong || plan.topic;
+  const short = plan.topic;
+  const goal = plan.goal || '';
+  const out = [];
+  const add = q => { const s = String(q).replace(/\s+/g, ' ').trim(); if (s.length > 2 && !out.includes(s)) out.push(s) };
+
+  if (plan.recency === 'current') {
+    add(`latest ${t} ${goal || 'developments'} ${month} ${year}`);
+    add(`${short} ${goal || 'news'} ${year}`);
+    add(`${t} breakthrough ${year}`);
+    add(`recent ${t} research ${year}`);
+    add(t);
+  } else {
+    add(plan.subject);
+    add(t);
+    if (goal) add(`${t} ${goal}`);
+    if (short !== t) add(short);
+  }
+  return out.slice(0, 5);
+}
+
+/* What the developer panel shows, and what the answer explains when it
+   says why it searched for what it searched for. */
+function explainPlan(plan) {
+  const L = [];
+  L.push('SUBJECT   ' + plan.subject);
+  L.push('TOPIC     ' + plan.topicLong + (plan.topic !== plan.topicLong ? `  (from "${plan.topic}")` : ''));
+  if (plan.goal) L.push('GOAL      ' + plan.goal);
+  L.push('RECENCY   ' + plan.recency);
+  L.push('TASKS     ' + plan.tasks.map(t => t.kind).join(' -> '));
+  if (plan.explain) L.push('STYLE     ' + plan.explain);
+  return L.join('\n');
+}
 
 /* ---- turning an intent into an answer -----------------------------
 
@@ -3546,7 +3895,18 @@ async function replyAsync(text,onStage){
   const t0=performance.now();
   const stage=s=>{if(onStage)onStage(s)};
   stage('thinking');
-  const r=reply(text);
+
+  /* What was actually asked? A compound request carries a subject and a
+     list of things to do with it, and answering the whole sentence as
+     one question is how "search the web for the latest AI development"
+     came back with the glossary entry for "search engine" — retrieval
+     matched the instruction words, because they were the only words it
+     was given. When a plan exists, the offline half answers the SUBJECT
+     and the instructions are carried out separately. */
+  const plan=(typeof parseRequest==='function')?parseRequest(text):null;
+  const compound=plan&&plan.compound;
+  const r=reply(compound?(plan.subject||text):text);
+  if(compound)r.plan=plan;
   r.timing=Object.assign({},PERF);delete r.timing._t;
   r.route=r.route||routeOf(r);
 
@@ -3554,6 +3914,7 @@ async function replyAsync(text,onStage){
   let need=(typeof webNeeded==='function')?webNeeded(text,r.conf||0,answered,r.say):null;
   /* an explicit /web is not a guess and does not need one */
   if(r.forceWeb)need={reason:'you asked me to look it up',force:true,strong:true};
+  if(plan&&plan.needsWeb)need={reason:'you asked me to look it up',force:true,strong:true};
   /* The web has nothing to say about how many parameters this app has,
      so questions about the app itself never leave the device. Everything
      else defers to the strength of the freshness signal rather than to
@@ -3569,11 +3930,12 @@ async function replyAsync(text,onStage){
   if(allow){
     const tW=performance.now();
     let search=null;
-    try{search=await webSearch(text,stage)}catch(e){search={ok:false,why:String(e.message||e)}}
+    try{search=await webSearch(text,stage,plan)}catch(e){search={ok:false,why:String(e.message||e)}}
     r.timing.web=+(performance.now()-tW).toFixed(2);
     if(search&&search.ok){
       stage('summarising');
-      const w=webAnswer(text,search);
+      /* summarise against the subject too, for the same reason */
+      const w=webAnswer(compound?plan.subject:text,search);
       if(w){
         const lead=answered&&r.conf>0.5?`${r.say}\n\n— checked online because ${need.reason}:\n\n`:'';
         r.say=lead+w.say;
@@ -3602,8 +3964,55 @@ async function replyAsync(text,onStage){
       }
     }
   }
+  /* ---- the rest of the plan ------------------------------------------
+     A compound request asked for more than an answer. Carry out what is
+     left in the order it was asked for, and say what was done — silently
+     skipping half a request is worse than refusing it. */
+  if(compound)finishPlan(r,plan,stage);
+
   r.totalMs=+(performance.now()-t0).toFixed(1);
   r.band=confBand(r.conf||0);
+  return r}
+
+/* Sources and memory are the two trailing tasks that need doing after
+   the answer exists, because both operate on it. */
+function finishPlan(r,plan,stage){
+  const done=[];
+  if(plan.needsSources){
+    const src=(r.web&&r.web.sources)||[];
+    if(src.length){
+      r.say+='\n\nSources:\n'+src.map(s=>`• ${s.title} — ${s.host} (${s.band} trust)${s.url?`\n  ${s.url}`:''}`).join('\n');
+      done.push('listed the sources');
+    }else{
+      r.say+='\n\nYou asked for sources and I have none to give — this answer came from what I know offline, not from the web.';
+      done.push('said there were no sources');
+    }
+  }
+  if(plan.remember){
+    if(stage)stage('storing the conclusion');
+    /* Store a conclusion, not a webpage. The subject is what the
+       question was about, the object is the sentence that answered it,
+       and where it came from is kept with it so it can be re-checked. */
+    /* the conclusion is what the WEB said when the web was used —
+       storing the offline lead instead would file a fact from a
+       different source than the one it was credited to */
+    const from=(r.web&&r.web.say)?r.web.say:r.say;
+    const concl=String(from).split(/\n\n/)[0].split(/(?<=[.!?])\s/)[0].trim().slice(0,240);
+    if(concl.length>8&&typeof memAdd==='function'){
+      const src=(r.web&&r.web.sources)||[];
+      const res=memAdd({s:plan.topicLong||plan.topic,r:'conclusion',o:concl,
+        src:r.web?'web':'internal',cf:r.web?CF.INFERRED:CF.STATED,imp:IMP.HIGH,
+        /* anything current needs re-checking; a definition does not */
+        tmp:plan.recency==='current'?Date.now()+30*24*3600e3:undefined,
+        note:src.length?src.map(x=>x.host).join(', '):undefined},{text:concl});
+      if(res&&res.rec){
+        r.say+=`\n\nRemembered: ${plan.topicLong||plan.topic} — ${concl}`+
+          (plan.recency==='current'?' (marked as something that goes out of date, so I will want to re-check it)':'');
+        r.grew=true;r.memId=res.rec.id;done.push('stored the conclusion');
+      }
+    }
+  }
+  r.planDone=done;
   return r}
 
 function routeOf(r){
